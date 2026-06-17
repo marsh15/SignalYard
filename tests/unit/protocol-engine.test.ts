@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { diffJson } from "@/protocol/contextDiff";
-import { ProtocolEngine } from "@/protocol/engine";
+import { createInitialSnapshot, ProtocolEngine } from "@/protocol/engine";
 import type { ClientMessage } from "@/protocol/types";
 
 function makeEngine(options: { ackFallbackMs?: number } = {}) {
@@ -12,8 +12,28 @@ function makeEngine(options: { ackFallbackMs?: number } = {}) {
   return { engine, outbound };
 }
 
+function makeHydratedEngine(snapshot: ReturnType<typeof createInitialSnapshot>) {
+  const outbound: ClientMessage[] = [];
+  const storageKey = `protocol-test-${crypto.randomUUID()}`;
+  window.sessionStorage.setItem(
+    storageKey,
+    JSON.stringify({
+      version: 1,
+      snapshot
+    })
+  );
+
+  const engine = new ProtocolEngine({
+    sender: (message) => outbound.push(message),
+    storageKey
+  });
+
+  return { engine, outbound, storageKey };
+}
+
 afterEach(() => {
   vi.useRealTimers();
+  window.sessionStorage.clear();
 });
 
 describe("ProtocolEngine ordering and replay", () => {
@@ -53,6 +73,60 @@ describe("ProtocolEngine ordering and replay", () => {
     expect(tokenItem?.kind).toBe("tokens");
     expect(tokenItem?.kind === "tokens" ? tokenItem.text : "").toBe("A");
     expect(engine.getSnapshot().chaos[0]?.label).toBe("Duplicate seq");
+
+    engine.dispose();
+  });
+
+  it("assigns unique timeline ids to repeated duplicate drops", () => {
+    const { engine } = makeEngine();
+
+    engine.ingest({ type: "TOKEN", seq: 1, stream_id: "main", text: "A" });
+    engine.ingest({ type: "TOKEN", seq: 1, stream_id: "main", text: "A" });
+    engine.ingest({ type: "TOKEN", seq: 1, stream_id: "main", text: "A" });
+
+    const duplicateRows = engine.getSnapshot().timelineRows.filter((row) => row.kind === "DUPLICATE");
+
+    expect(duplicateRows).toHaveLength(2);
+    expect(new Set(duplicateRows.map((row) => row.id)).size).toBe(duplicateRows.length);
+
+    engine.dispose();
+  });
+
+  it("continues duplicate timeline ids after hydration", () => {
+    const snapshot = createInitialSnapshot();
+    snapshot.lastRenderedSeq = 1;
+    snapshot.pendingRenderSeq = 1;
+    snapshot.nextExpectedSeq = 2;
+    snapshot.timelineRows = [
+      {
+        id: "token-main-1",
+        kind: "TOKEN",
+        seq: 1,
+        endSeq: 1,
+        streamId: "main",
+        text: "A"
+      },
+      {
+        id: "duplicate-1-TOKEN-1",
+        kind: "DUPLICATE",
+        seq: 1,
+        endSeq: 1,
+        label: "Duplicate dropped",
+        detail: "TOKEN",
+        severity: "warning"
+      }
+    ];
+
+    const { engine } = makeHydratedEngine(snapshot);
+
+    engine.ingest({ type: "TOKEN", seq: 1, stream_id: "main", text: "A" });
+
+    const duplicateIds = engine
+      .getSnapshot()
+      .timelineRows.filter((row) => row.kind === "DUPLICATE")
+      .map((row) => row.id);
+
+    expect(duplicateIds).toEqual(["duplicate-1-TOKEN-1", "duplicate-1-TOKEN-2"]);
 
     engine.dispose();
   });
@@ -167,6 +241,109 @@ describe("ProtocolEngine tool ACK policy", () => {
       call_id: "tool_gap"
     });
     expect(engine.getSnapshot().toolCards.tool_gap?.ackStatus).toBe("fallback-sent");
+
+    engine.dispose();
+  });
+
+  it("sends fallback TOOL_ACK for an in-order tool call if render commit is delayed", () => {
+    vi.useFakeTimers();
+    const { engine, outbound } = makeEngine({ ackFallbackMs: 250 });
+
+    engine.ingest({ type: "RUN_STARTED", seq: 1, title: "run" });
+    engine.ingest({
+      type: "TOOL_CALL",
+      seq: 2,
+      stream_id: "main",
+      call_id: "tool_slow_render",
+      tool_name: "search.logs",
+      args: { query: "q3" }
+    });
+
+    vi.advanceTimersByTime(250);
+    engine.commitRenderedSeq(2);
+
+    const ackMessages = outbound.filter((message) => message.type === "TOOL_ACK");
+    expect(ackMessages).toHaveLength(1);
+    expect(ackMessages[0]).toMatchObject({
+      call_id: "tool_slow_render"
+    });
+    expect(engine.getSnapshot().toolCards.tool_slow_render?.ackStatus).toBe("fallback-sent");
+
+    engine.dispose();
+  });
+
+  it("does not send fallback TOOL_ACK when post-render ACK wins first", () => {
+    vi.useFakeTimers();
+    const { engine, outbound } = makeEngine({ ackFallbackMs: 250 });
+
+    engine.ingest({ type: "RUN_STARTED", seq: 1, title: "run" });
+    engine.ingest({
+      type: "TOOL_CALL",
+      seq: 2,
+      stream_id: "main",
+      call_id: "tool_fast_render",
+      tool_name: "search.logs",
+      args: { query: "q3" }
+    });
+
+    engine.commitRenderedSeq(2);
+    vi.advanceTimersByTime(250);
+
+    const ackMessages = outbound.filter((message) => message.type === "TOOL_ACK");
+    expect(ackMessages).toHaveLength(1);
+    expect(engine.getSnapshot().toolCards.tool_fast_render?.ackStatus).toBe("sent");
+
+    engine.dispose();
+  });
+
+  it("rebuilds pending tool ACK state after hydration and flushes rendered tools", () => {
+    const snapshot = createInitialSnapshot();
+    snapshot.lastRenderedSeq = 2;
+    snapshot.pendingRenderSeq = 2;
+    snapshot.nextExpectedSeq = 3;
+    snapshot.toolCards.tool_resume = {
+      id: "tool_resume",
+      seq: 2,
+      streamId: "main",
+      name: "search.logs",
+      input: { query: "ack timeout" },
+      status: "pending",
+      ackStatus: "pending-render"
+    };
+
+    const { engine, outbound } = makeHydratedEngine(snapshot);
+
+    engine.commitRenderedSeq(2);
+
+    expect(outbound).toContainEqual({
+      type: "TOOL_ACK",
+      call_id: "tool_resume"
+    });
+    expect(engine.getSnapshot().toolCards.tool_resume?.ackStatus).toBe("sent");
+
+    engine.dispose();
+  });
+
+  it("does not resend a fallback ACK after hydration", () => {
+    const snapshot = createInitialSnapshot();
+    snapshot.lastRenderedSeq = 2;
+    snapshot.pendingRenderSeq = 2;
+    snapshot.nextExpectedSeq = 3;
+    snapshot.toolCards.tool_resume_fallback = {
+      id: "tool_resume_fallback",
+      seq: 2,
+      streamId: "main",
+      name: "search.logs",
+      input: { query: "already acked" },
+      status: "acked",
+      ackStatus: "fallback-sent"
+    };
+
+    const { engine, outbound } = makeHydratedEngine(snapshot);
+
+    engine.commitRenderedSeq(2);
+
+    expect(outbound.filter((message) => message.type === "TOOL_ACK")).toHaveLength(0);
 
     engine.dispose();
   });

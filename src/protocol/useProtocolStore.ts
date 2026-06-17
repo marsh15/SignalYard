@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useSyncExternalStore } from "react";
-import { getBrowserProtocolEngine, type ProtocolEngine } from "./engine";
+import { createInitialSnapshot, getBrowserProtocolEngine, type ProtocolEngine } from "./engine";
 import { playHarnessScenario, type HarnessScenario } from "./harness";
+
+const hydrationSnapshot = createInitialSnapshot();
 
 export function useProtocolEngine(scenario?: HarnessScenario): ProtocolEngine {
   const engine = useMemo(() => getBrowserProtocolEngine(), []);
@@ -29,5 +31,5 @@ export function useProtocolEngine(scenario?: HarnessScenario): ProtocolEngine {
 }
 
 export function useProtocolSnapshot(engine: ProtocolEngine) {
-  return useSyncExternalStore(engine.subscribe, engine.getSnapshot, engine.getSnapshot);
+  return useSyncExternalStore(engine.subscribe, engine.getSnapshot, () => hydrationSnapshot);
 }

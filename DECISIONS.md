@@ -18,7 +18,7 @@ Close/error transitions move to `reconnecting` immediately, so the indicator app
 
 ## TOOL_ACK Race
 
-Normal `TOOL_ACK` is sent after the tool card has committed. If a `TOOL_CALL` arrives out of order and is blocked for 1.5s, Signal Yard sends a fallback protocol ACK containing only `{ type: "TOOL_ACK", call_id }` and records the fallback reason internally in the timeline. When that tool later renders, the card is marked `fallback-sent` so a duplicate post-render ACK is not emitted.
+Normal `TOOL_ACK` is sent after the tool card has committed. Every `TOOL_CALL` also gets a 1.5s fallback timer, so a delayed render commit or an out-of-order gap cannot leave the server waiting indefinitely. The fallback protocol ACK contains only `{ type: "TOOL_ACK", call_id }` and records the fallback reason internally in the timeline. When that tool later renders, the card is marked `fallback-sent` so a duplicate post-render ACK is not emitted.
 
 ## 50-Stream Dashboard Changes
 

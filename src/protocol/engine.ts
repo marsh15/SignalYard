@@ -18,7 +18,7 @@ import {
 type Listener = () => void;
 type Sender = (message: ClientMessage) => void;
 type TimerHandle = ReturnType<typeof setTimeout>;
-type ToolAckReason = "post-render" | "fallback-out-of-order";
+type ToolAckReason = "post-render" | "fallback-timeout";
 
 interface ProtocolEngineOptions {
   url?: string;
@@ -34,7 +34,7 @@ const BACKOFF_MS = [500, 1_000, 2_000, 4_000, 10_000] as const;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 18_000;
 const STORAGE_VERSION = 1;
 
-function initialSnapshot(url: string): EngineSnapshot {
+export function createInitialSnapshot(url = DEFAULT_URL): EngineSnapshot {
   return {
     connection: {
       status: "idle",
@@ -101,6 +101,7 @@ export class ProtocolEngine {
   private ackFallbackMs: number;
   private heartbeatTimeoutMs: number;
   private storageKey?: string;
+  private duplicateTimelineRowCounter = 0;
 
   constructor(options: ProtocolEngineOptions = {}) {
     const url = options.url ?? DEFAULT_URL;
@@ -140,6 +141,7 @@ export class ProtocolEngine {
     this.socket.onopen = () => {
       this.setConnection("resuming", { attempt: 0 });
       this.send({ type: "RESUME", last_seq: this.snapshot.lastRenderedSeq });
+      this.flushRenderedToolAcks(this.snapshot.lastRenderedSeq);
       this.setConnection("connected", { attempt: 0 });
       this.markPacketReceived();
     };
@@ -220,7 +222,7 @@ export class ProtocolEngine {
         seq: event.seq
       });
       this.addTimelineRow({
-        id: `duplicate-${event.seq}-${event.type}`,
+        id: `duplicate-${event.seq}-${event.type}-${++this.duplicateTimelineRowCounter}`,
         kind: "DUPLICATE",
         seq: event.seq,
         endSeq: event.seq,
@@ -234,7 +236,7 @@ export class ProtocolEngine {
 
     this.seenSeqs.add(event.seq);
 
-    if (event.type === "TOOL_CALL" && event.seq !== this.snapshot.nextExpectedSeq) {
+    if (event.type === "TOOL_CALL") {
       this.scheduleFallbackAck(event);
     }
 
@@ -263,10 +265,15 @@ export class ProtocolEngine {
 
   commitRenderedSeq(seq: number) {
     if (seq <= this.snapshot.lastRenderedSeq) {
+      this.flushRenderedToolAcks(this.snapshot.lastRenderedSeq);
       return;
     }
 
     const boundedSeq = Math.min(seq, this.snapshot.pendingRenderSeq);
+    this.flushRenderedToolAcks(boundedSeq);
+  }
+
+  private flushRenderedToolAcks(boundedSeq: number) {
     const toolCards = { ...this.snapshot.toolCards };
 
     for (const toolCall of this.processedToolCalls.values()) {
@@ -285,7 +292,7 @@ export class ProtocolEngine {
 
     this.snapshot = {
       ...this.snapshot,
-      lastRenderedSeq: boundedSeq,
+      lastRenderedSeq: Math.max(this.snapshot.lastRenderedSeq, boundedSeq),
       toolCards
     };
     this.notify();
@@ -378,7 +385,7 @@ export class ProtocolEngine {
     this.clearHeartbeatTimer();
     this.pendingFallbackAcks.forEach((timer) => clearTimeout(timer));
     this.pendingFallbackAcks.clear();
-    this.snapshot = initialSnapshot(url);
+    this.snapshot = createInitialSnapshot(url);
     this.rebuildRuntimeIndexes();
     this.persistSnapshot();
     this.notify();
@@ -417,22 +424,22 @@ export class ProtocolEngine {
 
   private hydrateSnapshot(url: string): EngineSnapshot {
     if (!this.storageKey || typeof window === "undefined") {
-      return initialSnapshot(url);
+      return createInitialSnapshot(url);
     }
 
     try {
       const raw = window.sessionStorage.getItem(this.storageKey);
       if (!raw) {
-        return initialSnapshot(url);
+        return createInitialSnapshot(url);
       }
 
       const parsed = JSON.parse(raw) as { version?: number; snapshot?: EngineSnapshot };
       if (parsed.version !== STORAGE_VERSION || !parsed.snapshot) {
-        return initialSnapshot(url);
+        return createInitialSnapshot(url);
       }
 
       return {
-        ...initialSnapshot(url),
+        ...createInitialSnapshot(url),
         ...parsed.snapshot,
         connection: {
           ...parsed.snapshot.connection,
@@ -444,7 +451,7 @@ export class ProtocolEngine {
         canSend: false
       };
     } catch {
-      return initialSnapshot(url);
+      return createInitialSnapshot(url);
     }
   }
 
@@ -453,9 +460,33 @@ export class ProtocolEngine {
     for (let seq = 1; seq < this.snapshot.nextExpectedSeq; seq += 1) {
       this.seenSeqs.add(seq);
     }
+    this.duplicateTimelineRowCounter = this.snapshot.timelineRows.reduce((max, row) => {
+      if (row.kind !== "DUPLICATE") {
+        return max;
+      }
+
+      const counter = Number(row.id.match(/-(\d+)$/)?.[1] ?? 0);
+      return Number.isFinite(counter) ? Math.max(max, counter) : max;
+    }, 0);
     this.orderedBuffer.clear();
     this.fallbackAckedToolCalls.clear();
     this.processedToolCalls.clear();
+
+    for (const card of Object.values(this.snapshot.toolCards)) {
+      const toolCall: ToolCallEvent = {
+        type: "TOOL_CALL",
+        seq: card.seq,
+        stream_id: card.streamId,
+        call_id: card.id,
+        tool_name: card.name,
+        args: card.input
+      };
+      this.processedToolCalls.set(card.id, toolCall);
+
+      if (card.ackStatus === "fallback-sent") {
+        this.fallbackAckedToolCalls.add(card.id);
+      }
+    }
   }
 
   private processOrdered() {
@@ -679,7 +710,6 @@ export class ProtocolEngine {
   }
 
   private addToolCall(event: ToolCallEvent) {
-    this.clearFallbackAck(event.call_id);
     this.processedToolCalls.set(event.call_id, event);
 
     const workItems = this.snapshot.workItems.map((item) =>
@@ -826,11 +856,11 @@ export class ProtocolEngine {
         return;
       }
 
-      this.sendToolAck(event, "fallback-out-of-order");
+      this.sendToolAck(event, "fallback-timeout");
       this.fallbackAckedToolCalls.add(event.call_id);
       this.addChaos({
         label: "Fallback TOOL_ACK",
-        detail: `${event.tool_name} seq ${event.seq} waited ${this.ackFallbackMs}ms out of order`,
+        detail: `${event.tool_name} seq ${event.seq} waited ${this.ackFallbackMs}ms for render ACK`,
         severity: "warning",
         seq: event.seq
       });
