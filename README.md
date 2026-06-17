@@ -1,8 +1,10 @@
 # Signal Yard
 
-Signal Yard is a Next.js App Router agent operations console for evaluator-facing protocol runs. It defaults to `ws://localhost:4747/ws`, keeps protocol state outside React, and renders chat streams, tool calls, trace rows, context diffs, reconnect evidence, and chaos artifacts in one console.
+This is my submission for the Full Stack AI Engineer assignment. It is a Next.js App Router app that connects to the provided agent server at `ws://localhost:4747/ws`, streams agent responses, shows tool calls, keeps a trace timeline, displays context snapshots, and handles reconnects.
 
 ## Run
+
+Install dependencies and run the production build:
 
 ```bash
 npm install
@@ -10,33 +12,58 @@ npm run build
 npm run start
 ```
 
-For local development:
+For development:
 
 ```bash
 npm run dev
 ```
 
-The production runtime expects the provided Docker `agent-server` to serve the WebSocket protocol at `ws://localhost:4747/ws`. Deterministic non-production scenarios are available with `?scenario=tool-stream`, `?scenario=reconnect`, `?scenario=rapid-tools`, `?scenario=large-context`, and `?scenario=chaos`.
+The app expects the provided Docker `agent-server` to be running on port `4747`.
 
-## Submission Checklist
+```bash
+docker build -t agent-server ./agent-server
+docker run -p 4747:4747 agent-server
+```
 
-- Repository contains the app source, protocol engine, UI components, tests, screenshots, chaos recording, and decision notes.
-- Generated dependency/build/test folders are ignored: `node_modules`, `.next`, `playwright-report`, and `test-results`.
-- Primary evidence artifacts are committed under `docs/`:
+For chaos mode:
+
+```bash
+docker run -p 4747:4747 agent-server --mode chaos
+```
+
+I also added local scenarios for testing without the backend:
+
+- `?scenario=tool-stream`
+- `?scenario=reconnect`
+- `?scenario=rapid-tools`
+- `?scenario=large-context`
+- `?scenario=chaos`
+
+## What Is Included
+
+- App source and UI components
+- WebSocket protocol handling
+- Reconnect and resume handling
+- Ordered sequence buffering and duplicate handling
+- Context diffing
+- Unit and e2e tests
+- Screenshots and chaos recording under `docs/`
   - `docs/screenshots/tool-stream.png`
   - `docs/screenshots/trace-tools-filter.png`
   - `docs/screenshots/context-diff.png`
   - `docs/recordings/chaos.webm`
-- Decision rationale is documented in `DECISIONS.md`.
+- Notes about the main decisions in `DECISIONS.md`
 
-## Architecture
+## Project Structure
 
-- `src/protocol/engine.ts`: WebSocket lifecycle, resume-first reconnect, ordered seq buffer, dedupe, heartbeat, immediate PONG, TOOL_ACK policy, journal, and derived snapshots.
-- `src/protocol/types.ts`: discriminated unions plus Zod validation for inbound `unknown`.
-- `src/workers/contextDiff.worker.ts`: worker-backed JSON diffing for context snapshots, with a synchronous test/runtime fallback.
-- `src/components/*`: React views that subscribe with `useSyncExternalStore` and render derived state only.
-- `tests/unit/*`: protocol ordering, replay, heartbeat, ACK, streaming, and diff tests.
-- `tests/e2e/*`: browser scenarios and deliverable screenshot/recording capture.
+- `src/protocol/engine.ts` has the WebSocket lifecycle, reconnect logic, sequence ordering, dedupe, heartbeat, and `TOOL_ACK` handling.
+- `src/protocol/types.ts` has the protocol types and validation.
+- `src/protocol/contextDiff.ts` and `src/workers/contextDiff.worker.ts` handle context diffs.
+- `src/components/` has the chat, trace timeline, and context inspector UI.
+- `tests/unit/` has protocol and diff tests.
+- `tests/e2e/` has browser tests and screenshot/recording capture.
+
+## State Machine
 
 ```mermaid
 stateDiagram-v2
@@ -54,7 +81,7 @@ stateDiagram-v2
   Reconnecting --> Connecting: 500ms -> 1s -> 2s -> 4s -> 10s
 ```
 
-## Test And Capture
+## Tests
 
 ```bash
 npm run test
@@ -69,20 +96,8 @@ npm run screenshots
 - `docs/screenshots/context-diff.png`
 - `docs/recordings/chaos.webm`
 
-The recording path is the mandatory chaos artifact. External submission hosting/name details are intentionally left for final submission time.
-
-## Deployment
-
-The repository is sufficient for code review and automated evaluation. A deployment is useful if the submission form asks for a live URL or if evaluators need to inspect the UI without cloning the repo.
-
-For Vercel, import the GitHub repository and use the default Next.js settings:
-
-- Install command: `npm install`
-- Build command: `npm run build`
-- Output: Next.js default
-
-The deployed app can demonstrate deterministic local scenarios with query strings such as `?scenario=tool-stream` and `?scenario=chaos`. A live production protocol run still needs a reachable WebSocket server compatible with the assignment protocol.
-
 ## Protocol Notes
 
-Server events must include positive integer `seq` values. Signal Yard deduplicates received seqs, buffers future seqs until gaps fill, processes ordered events only, and advances `lastRenderedSeq` only from a React post-commit effect. `PING` is the control-plane exception: `PONG` is sent immediately on receipt, while PING/PONG timeline rows still render in seq order.
+The client processes server messages by `seq`. It buffers future messages until the missing sequence arrives and ignores duplicate sequence numbers. `lastRenderedSeq` is advanced after React commits the rendered state, so reconnects use the last event that was actually rendered.
+
+`PING` is handled immediately so the server gets a timely `PONG`, including for empty heartbeat challenges. The PING/PONG rows are still shown in the timeline in sequence order.
