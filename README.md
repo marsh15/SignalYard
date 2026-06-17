@@ -100,4 +100,4 @@ npm run screenshots
 
 The client processes server messages by `seq`. It buffers future messages until the missing sequence arrives and ignores duplicate sequence numbers. `lastRenderedSeq` is advanced after React commits the rendered state, so reconnects use the last event that was actually rendered.
 
-`PING` is handled immediately so the server gets a timely `PONG`, including for empty heartbeat challenges. The PING/PONG rows are still shown in the timeline in sequence order.
+Live `PING` is handled immediately so the server gets a timely `PONG`, including for empty heartbeat challenges. During resume replay, historical `PING` events are rendered in the timeline without sending new `PONG`s, because the server no longer has those old heartbeat challenges pending.

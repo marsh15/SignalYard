@@ -3,6 +3,50 @@ import { diffJson } from "@/protocol/contextDiff";
 import { createInitialSnapshot, ProtocolEngine } from "@/protocol/engine";
 import type { ClientMessage } from "@/protocol/types";
 
+const originalWebSocket = globalThis.WebSocket;
+
+class TestWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+  static instances: TestWebSocket[] = [];
+
+  readonly sent: string[] = [];
+  readyState = TestWebSocket.CONNECTING;
+  onopen: ((event: Event) => void) | null = null;
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  onclose: ((event: CloseEvent) => void) | null = null;
+
+  constructor(readonly url: string) {
+    TestWebSocket.instances.push(this);
+  }
+
+  send(data: string) {
+    this.sent.push(data);
+  }
+
+  close() {
+    this.readyState = TestWebSocket.CLOSED;
+  }
+
+  open() {
+    this.readyState = TestWebSocket.OPEN;
+    this.onopen?.(new Event("open"));
+  }
+
+  closeFromServer() {
+    this.readyState = TestWebSocket.CLOSED;
+    this.onclose?.({} as CloseEvent);
+  }
+}
+
+function installTestWebSocket() {
+  TestWebSocket.instances = [];
+  globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+}
+
 function makeEngine(options: { ackFallbackMs?: number } = {}) {
   const outbound: ClientMessage[] = [];
   const engine = new ProtocolEngine({
@@ -34,6 +78,7 @@ function makeHydratedEngine(snapshot: ReturnType<typeof createInitialSnapshot>) 
 afterEach(() => {
   vi.useRealTimers();
   window.sessionStorage.clear();
+  globalThis.WebSocket = originalWebSocket;
 });
 
 describe("ProtocolEngine ordering and replay", () => {
@@ -179,6 +224,55 @@ describe("ProtocolEngine control plane", () => {
     engine.dispose();
   });
 
+  it("does not reply again when a PING seq is replayed", () => {
+    const { engine, outbound } = makeEngine();
+
+    engine.ingest({ type: "PING", seq: 1, challenge: "chaos-1" });
+    engine.ingest({ type: "PING", seq: 1, challenge: "chaos-1" });
+
+    expect(outbound.filter((message) => message.type === "PONG")).toEqual([
+      {
+        type: "PONG",
+        echo: "chaos-1"
+      }
+    ]);
+    expect(engine.getSnapshot().timelineRows.filter((row) => row.kind === "PONG")).toHaveLength(1);
+    expect(engine.getSnapshot().stats.duplicateSeqs).toBe(1);
+
+    engine.dispose();
+  });
+
+  it("does not answer historical PINGs during a resume replay burst", () => {
+    vi.useFakeTimers();
+    installTestWebSocket();
+    const snapshot = createInitialSnapshot();
+    snapshot.lastRenderedSeq = 11;
+    snapshot.pendingRenderSeq = 11;
+    snapshot.nextExpectedSeq = 12;
+    const { engine, outbound } = makeHydratedEngine(snapshot);
+
+    engine.connect();
+    TestWebSocket.instances[0]?.open();
+    engine.ingest({ type: "PING", seq: 12, challenge: "old-heartbeat" });
+
+    expect(outbound).toContainEqual({ type: "RESUME", last_seq: 11 });
+    expect(outbound.filter((message) => message.type === "PONG")).toHaveLength(0);
+    expect(engine.getSnapshot().timelineRows.filter((row) => row.kind === "PING")).toHaveLength(1);
+    expect(engine.getSnapshot().timelineRows.filter((row) => row.kind === "PONG")).toHaveLength(0);
+
+    vi.advanceTimersByTime(750);
+    engine.ingest({ type: "PING", seq: 13, challenge: "live-heartbeat" });
+
+    expect(outbound.filter((message) => message.type === "PONG")).toEqual([
+      {
+        type: "PONG",
+        echo: "live-heartbeat"
+      }
+    ]);
+
+    engine.dispose();
+  });
+
   it("tracks duplicate and gap counters", () => {
     const { engine } = makeEngine();
 
@@ -188,6 +282,49 @@ describe("ProtocolEngine control plane", () => {
 
     expect(engine.getSnapshot().stats.gapBuffered).toBe(1);
     expect(engine.getSnapshot().stats.duplicateSeqs).toBe(1);
+
+    engine.dispose();
+  });
+});
+
+describe("ProtocolEngine WebSocket lifecycle", () => {
+  it("does not reconnect after an intentional disconnect", () => {
+    vi.useFakeTimers();
+    installTestWebSocket();
+    const engine = new ProtocolEngine();
+
+    engine.connect();
+    const socket = TestWebSocket.instances[0];
+    socket?.open();
+    engine.disconnect();
+    socket?.closeFromServer();
+    vi.advanceTimersByTime(10_000);
+
+    expect(TestWebSocket.instances).toHaveLength(1);
+    expect(engine.getSnapshot().connection.status).toBe("closed");
+
+    engine.dispose();
+  });
+
+  it("ignores close events from sockets that have already been replaced", () => {
+    vi.useFakeTimers();
+    installTestWebSocket();
+    const engine = new ProtocolEngine();
+
+    engine.connect();
+    const staleSocket = TestWebSocket.instances[0];
+    staleSocket?.open();
+    if (staleSocket) {
+      staleSocket.readyState = TestWebSocket.CLOSING;
+    }
+    engine.connect();
+
+    expect(TestWebSocket.instances).toHaveLength(2);
+
+    staleSocket?.closeFromServer();
+    vi.advanceTimersByTime(500);
+
+    expect(TestWebSocket.instances).toHaveLength(2);
 
     engine.dispose();
   });

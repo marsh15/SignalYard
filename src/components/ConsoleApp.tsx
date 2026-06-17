@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Activity, Braces, Gauge, Network, RadioTower, RotateCcw, TerminalSquare } from "lucide-react";
+import { Activity, Gauge, Network, RadioTower, RotateCcw, TerminalSquare } from "lucide-react";
 import type { ProtocolEngine } from "@/protocol/engine";
 import type { HarnessScenario } from "@/protocol/harness";
 import { useProtocolEngine, useProtocolSnapshot } from "@/protocol/useProtocolStore";
@@ -80,7 +80,7 @@ function TopBar({
           : "bg-white text-yard-muted";
 
   return (
-    <header className="flex min-h-[64px] items-center gap-3 border-b border-yard-line bg-white px-3 sm:px-4">
+    <header className="grid min-h-[64px] grid-cols-[auto_minmax(0,1fr)] items-center gap-3 border-b border-yard-line bg-white px-3 py-2 sm:px-4 lg:grid-cols-[auto_minmax(0,1fr)_auto]">
       <div className="flex min-w-[190px] items-center gap-3">
         <div className="grid h-9 w-9 place-items-center rounded-md bg-yard-ink text-white">
           <RadioTower className="h-5 w-5" aria-hidden="true" />
@@ -91,7 +91,7 @@ function TopBar({
         </div>
       </div>
 
-      <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto scrollbar-thin">
+      <div className="flex min-w-0 items-center gap-2 overflow-x-auto scrollbar-thin">
         <StatusChip
           icon={<Activity className="h-3.5 w-3.5" aria-hidden="true" />}
           label={snapshot.connection.status}
@@ -99,7 +99,8 @@ function TopBar({
         />
         <StatusChip
           icon={<TerminalSquare className="h-3.5 w-3.5" aria-hidden="true" />}
-          label={`lastRenderedSeq ${snapshot.lastRenderedSeq}`}
+          label={`rendered ${snapshot.lastRenderedSeq}`}
+          title={`lastRenderedSeq ${snapshot.lastRenderedSeq}`}
         />
         <StatusChip
           icon={<RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />}
@@ -111,12 +112,12 @@ function TopBar({
         />
         <StatusChip
           icon={<Network className="h-3.5 w-3.5" aria-hidden="true" />}
-          label={`${formatKiB(snapshot.stats.bytesReceived)} · dup ${snapshot.stats.duplicateSeqs} · gaps ${snapshot.stats.gapBuffered}`}
+          label={`${formatKiB(snapshot.stats.bytesReceived)} · d${snapshot.stats.duplicateSeqs} · g${snapshot.stats.gapBuffered}`}
+          title={`${formatKiB(snapshot.stats.bytesReceived)} · dup ${snapshot.stats.duplicateSeqs} · gaps ${snapshot.stats.gapBuffered}`}
         />
-        {scenario ? <StatusChip icon={<Braces className="h-3.5 w-3.5" aria-hidden="true" />} label={`harness ${scenario}`} /> : null}
       </div>
 
-      <div className="flex max-w-[46%] items-center gap-2 overflow-hidden sm:max-w-[52%] lg:max-w-[54%]">
+      <div className="col-span-2 flex min-w-0 items-center justify-end gap-2 overflow-hidden lg:col-span-1 lg:min-w-[390px]">
         <select
           aria-label="Scenario"
           value={scenario ?? ""}
@@ -124,7 +125,7 @@ function TopBar({
             const value = event.target.value;
             onScenarioChange(value ? (value as HarnessScenario) : undefined);
           }}
-          className="h-8 shrink-0 rounded border border-yard-line bg-yard-wash px-2 text-xs font-semibold text-yard-ink"
+          className="h-8 w-[172px] shrink-0 rounded border border-yard-line bg-yard-wash px-2 text-xs font-semibold text-yard-ink"
         >
           <option value="">live socket</option>
           {scenarios.map((candidate) => (
@@ -134,25 +135,38 @@ function TopBar({
           ))}
         </select>
         {snapshot.chaos.length === 0 ? (
-          <span className="whitespace-nowrap rounded border border-yard-line bg-yard-wash px-2 py-1 text-xs font-medium text-yard-muted">
+          <span className="shrink-0 whitespace-nowrap rounded border border-yard-line bg-yard-wash px-2 py-1 text-xs font-medium text-yard-muted">
             chaos evidence: clean
           </span>
         ) : (
-          snapshot.chaos.slice(0, 4).map((badge) => (
-            <span
-              key={badge.id}
-              className={cn(
-                "max-w-[180px] truncate rounded border px-2 py-1 text-xs font-medium",
-                badge.severity === "success" && "border-yard-teal/20 bg-yard-tealSoft text-yard-teal",
-                badge.severity === "warning" && "border-yard-amber/20 bg-yard-amberSoft text-yard-amber",
-                badge.severity === "error" && "border-yard-rose/20 bg-yard-roseSoft text-yard-rose",
-                badge.severity === "info" && "border-yard-line bg-yard-wash text-yard-muted"
-              )}
-              title={`${badge.label}: ${badge.detail}`}
-            >
-              {badge.label}
-            </span>
-          ))
+          <>
+            {snapshot.chaos.slice(0, 2).map((badge) => (
+              <span
+                key={badge.id}
+                className={cn(
+                  "max-w-[10rem] shrink truncate rounded border px-2 py-1 text-xs font-medium",
+                  badge.severity === "success" && "border-yard-teal/20 bg-yard-tealSoft text-yard-teal",
+                  badge.severity === "warning" && "border-yard-amber/20 bg-yard-amberSoft text-yard-amber",
+                  badge.severity === "error" && "border-yard-rose/20 bg-yard-roseSoft text-yard-rose",
+                  badge.severity === "info" && "border-yard-line bg-yard-wash text-yard-muted"
+                )}
+                title={`${badge.label}: ${badge.detail}`}
+              >
+                {badge.label}
+              </span>
+            ))}
+            {snapshot.chaos.length > 2 ? (
+              <span
+                className="shrink-0 whitespace-nowrap rounded border border-yard-line bg-yard-wash px-2 py-1 text-xs font-medium text-yard-muted"
+                title={snapshot.chaos
+                  .slice(2)
+                  .map((badge) => `${badge.label}: ${badge.detail}`)
+                  .join("\n")}
+              >
+                +{snapshot.chaos.length - 2}
+              </span>
+            ) : null}
+          </>
         )}
       </div>
     </header>
@@ -166,14 +180,17 @@ function formatKiB(bytes: number): string {
 function StatusChip({
   icon,
   label,
-  className
+  className,
+  title
 }: {
   icon: React.ReactNode;
   label: string;
   className?: string;
+  title?: string;
 }) {
   return (
     <span
+      title={title}
       className={cn(
         "inline-flex h-8 shrink-0 items-center gap-1.5 rounded border border-yard-line bg-yard-wash px-2.5 text-xs font-semibold text-yard-muted",
         className

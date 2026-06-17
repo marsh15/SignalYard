@@ -95,6 +95,7 @@ export class ProtocolEngine {
   private socket?: WebSocket;
   private reconnectTimer?: TimerHandle;
   private heartbeatTimer?: TimerHandle;
+  private resumeReplayTimer?: TimerHandle;
   private notifyRaf?: number;
   private sender?: Sender;
   private diffWorker?: Worker;
@@ -102,6 +103,8 @@ export class ProtocolEngine {
   private heartbeatTimeoutMs: number;
   private storageKey?: string;
   private duplicateTimelineRowCounter = 0;
+  private suppressReplayPongs = false;
+  private pongedPingSeqs = new Set<number>();
 
   constructor(options: ProtocolEngineOptions = {}) {
     const url = options.url ?? DEFAULT_URL;
@@ -134,37 +137,64 @@ export class ProtocolEngine {
       return;
     }
 
+    if (this.socket?.readyState === WebSocket.CONNECTING || this.socket?.readyState === WebSocket.OPEN) {
+      return;
+    }
+
     this.clearReconnectTimer();
     this.setConnection("connecting", { attempt: this.snapshot.connection.attempt });
-    this.socket = new WebSocket(this.snapshot.connection.url);
+    const socket = new WebSocket(this.snapshot.connection.url);
+    this.socket = socket;
 
-    this.socket.onopen = () => {
+    socket.onopen = () => {
+      if (this.socket !== socket) {
+        socket.close();
+        return;
+      }
+
       this.setConnection("resuming", { attempt: 0 });
+      this.beginResumeReplayGuard(this.snapshot.lastRenderedSeq);
       this.send({ type: "RESUME", last_seq: this.snapshot.lastRenderedSeq });
       this.flushRenderedToolAcks(this.snapshot.lastRenderedSeq);
       this.setConnection("connected", { attempt: 0 });
       this.markPacketReceived();
     };
 
-    this.socket.onmessage = (event: globalThis.MessageEvent) => {
+    socket.onmessage = (event: globalThis.MessageEvent) => {
+      if (this.socket !== socket) {
+        return;
+      }
+
       this.ingestSocketData(event.data);
     };
 
-    this.socket.onerror = () => {
+    socket.onerror = () => {
+      if (this.socket !== socket) {
+        return;
+      }
+
       this.setConnection("error", { lastError: "WebSocket error" });
     };
 
-    this.socket.onclose = () => {
+    socket.onclose = () => {
+      if (this.socket !== socket) {
+        return;
+      }
+
+      this.socket = undefined;
       this.clearHeartbeatTimer();
       this.scheduleReconnect();
     };
   }
 
   disconnect() {
+    const socket = this.socket;
+    this.socket = undefined;
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
-    this.socket?.close();
-    this.socket = undefined;
+    this.clearResumeReplayTimer();
+    this.suppressReplayPongs = false;
+    socket?.close();
     this.setConnection("closed", { reconnectInMs: undefined });
   }
 
@@ -191,21 +221,7 @@ export class ProtocolEngine {
     }
 
     this.markPacketReceived();
-
-    if (event.type === "PING") {
-      const rttStartedAt = performanceNow();
-      this.send({
-        type: "PONG",
-        echo: event.challenge ?? ""
-      });
-      this.snapshot = {
-        ...this.snapshot,
-        stats: {
-          ...this.snapshot.stats,
-          lastRttMs: Math.max(0, Math.round(performanceNow() - rttStartedAt))
-        }
-      };
-    }
+    this.bumpResumeReplayGuard();
 
     if (this.seenSeqs.has(event.seq)) {
       this.snapshot = {
@@ -235,6 +251,22 @@ export class ProtocolEngine {
     }
 
     this.seenSeqs.add(event.seq);
+
+    if (event.type === "PING" && !this.suppressReplayPongs) {
+      const rttStartedAt = performanceNow();
+      this.send({
+        type: "PONG",
+        echo: event.challenge ?? ""
+      });
+      this.pongedPingSeqs.add(event.seq);
+      this.snapshot = {
+        ...this.snapshot,
+        stats: {
+          ...this.snapshot.stats,
+          lastRttMs: Math.max(0, Math.round(performanceNow() - rttStartedAt))
+        }
+      };
+    }
 
     if (event.type === "TOOL_CALL") {
       this.scheduleFallbackAck(event);
@@ -383,6 +415,8 @@ export class ProtocolEngine {
   reset(url = this.snapshot.connection.url) {
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
+    this.clearResumeReplayTimer();
+    this.suppressReplayPongs = false;
     this.pendingFallbackAcks.forEach((timer) => clearTimeout(timer));
     this.pendingFallbackAcks.clear();
     this.snapshot = createInitialSnapshot(url);
@@ -471,6 +505,7 @@ export class ProtocolEngine {
     this.orderedBuffer.clear();
     this.fallbackAckedToolCalls.clear();
     this.processedToolCalls.clear();
+    this.pongedPingSeqs.clear();
 
     for (const card of Object.values(this.snapshot.toolCards)) {
       const toolCall: ToolCallEvent = {
@@ -589,15 +624,17 @@ export class ProtocolEngine {
           detail: `challenge: ${event.challenge ?? "<empty>"}`,
           severity: "info"
         });
-        this.addTimelineRow({
-          id: `pong-${event.seq}`,
-          kind: "PONG",
-          seq: event.seq,
-          endSeq: event.seq,
-          label: "PONG",
-          detail: `lastRenderedSeq ${this.snapshot.lastRenderedSeq}`,
-          severity: "success"
-        });
+        if (this.pongedPingSeqs.has(event.seq)) {
+          this.addTimelineRow({
+            id: `pong-${event.seq}`,
+            kind: "PONG",
+            seq: event.seq,
+            endSeq: event.seq,
+            label: "PONG",
+            detail: `lastRenderedSeq ${this.snapshot.lastRenderedSeq}`,
+            severity: "success"
+          });
+        }
         break;
       case "MESSAGE":
         this.addMessage(event);
@@ -988,7 +1025,6 @@ export class ProtocolEngine {
         severity: "warning"
       });
       this.socket?.close();
-      this.scheduleReconnect();
     }, this.heartbeatTimeoutMs);
   }
 
@@ -996,6 +1032,31 @@ export class ProtocolEngine {
     if (this.heartbeatTimer) {
       clearTimeout(this.heartbeatTimer);
       this.heartbeatTimer = undefined;
+    }
+  }
+
+  private beginResumeReplayGuard(resumeSeq: number) {
+    this.clearResumeReplayTimer();
+    this.suppressReplayPongs = resumeSeq > 0;
+    this.bumpResumeReplayGuard();
+  }
+
+  private bumpResumeReplayGuard() {
+    if (!this.suppressReplayPongs) {
+      return;
+    }
+
+    this.clearResumeReplayTimer();
+    this.resumeReplayTimer = setTimeout(() => {
+      this.resumeReplayTimer = undefined;
+      this.suppressReplayPongs = false;
+    }, 750);
+  }
+
+  private clearResumeReplayTimer() {
+    if (this.resumeReplayTimer) {
+      clearTimeout(this.resumeReplayTimer);
+      this.resumeReplayTimer = undefined;
     }
   }
 
