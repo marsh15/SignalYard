@@ -1,18 +1,26 @@
 import { defineConfig, devices } from "@playwright/test";
 
+/**
+ * Dedicated config for `npm run record:chaos`.
+ *
+ * The default `playwright.config.ts` excludes `*.manual.spec.ts` files from
+ * `npm run test:e2e` because this recording depends on an external Docker
+ * container (`agent-server --mode chaos`) and runs for several minutes. This
+ * config drops that exclusion so the manual chaos recording can be invoked
+ * directly and deterministically.
+ */
 export default defineConfig({
   testDir: "./tests/e2e",
-  testIgnore: /.*\.manual\.spec\.ts/,
-  timeout: 60_000,
+  testMatch: /chaos-live\.manual\.spec\.ts/,
+  timeout: 6 * 60_000,
   expect: {
     timeout: 5_000
   },
-  fullyParallel: true,
-  reporter: [["list"], ["html", { outputFolder: "playwright-report", open: "never" }]],
+  fullyParallel: false,
+  reporter: [["list"]],
   use: {
     baseURL: "http://127.0.0.1:3000",
     trace: "retain-on-failure",
-    video: "retain-on-failure",
     screenshot: "only-on-failure"
   },
   webServer: {
@@ -25,10 +33,6 @@ export default defineConfig({
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"] }
-    },
-    {
-      name: "mobile",
-      use: { ...devices["Pixel 7"] }
     }
   ]
 });

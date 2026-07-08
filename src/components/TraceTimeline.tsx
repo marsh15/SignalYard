@@ -1,8 +1,8 @@
 "use client";
 
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Braces, Bug, Filter, Link2, MessageSquareText, Search, ShieldAlert, Wrench } from "lucide-react";
+import { Braces, Bug, ChevronDown, ChevronRight, Filter, Link2, MessageSquareText, Search, ShieldAlert, Wrench } from "lucide-react";
 import type { ProtocolEngine } from "@/protocol/engine";
 import type { EngineSnapshot, TimelineRow } from "@/protocol/types";
 import { cn, PanelHeader, SeqLabel } from "./ui";
@@ -14,6 +14,7 @@ interface TraceTimelineProps {
 
 export function TraceTimeline({ engine, snapshot }: TraceTimelineProps) {
   const parentRef = useRef<HTMLDivElement | null>(null);
+  const [expandedRows, setExpandedRows] = useState<Set<string>>(() => new Set());
   const visibleRows = useMemo(() => filterRows(snapshot), [snapshot]);
   const virtualizer = useVirtualizer({
     count: visibleRows.length,
@@ -21,6 +22,16 @@ export function TraceTimeline({ engine, snapshot }: TraceTimelineProps) {
     estimateSize: () => 52,
     overscan: 12
   });
+  const selectedIndex = useMemo(
+    () => visibleRows.findIndex((row) => row.id === snapshot.selectedTimelineRowId),
+    [snapshot.selectedTimelineRowId, visibleRows]
+  );
+
+  useEffect(() => {
+    if (selectedIndex >= 0) {
+      virtualizer.scrollToIndex(selectedIndex, { align: "center" });
+    }
+  }, [selectedIndex, virtualizer]);
 
   return (
     <section className="flex min-h-0 flex-col bg-white">
@@ -105,7 +116,21 @@ export function TraceTimeline({ engine, snapshot }: TraceTimelineProps) {
                     "toolCallId" in row &&
                     Boolean(row.toolCallId && snapshot.highlightedToolCallId === row.toolCallId)
                   }
-                  onClick={() => engine.selectTimelineRow(row.id)}
+                  expanded={expandedRows.has(row.id)}
+                  onClick={() => {
+                    engine.selectTimelineRow(row.id);
+                    if (row.kind === "TOKEN") {
+                      setExpandedRows((current) => {
+                        const next = new Set(current);
+                        if (next.has(row.id)) {
+                          next.delete(row.id);
+                        } else {
+                          next.add(row.id);
+                        }
+                        return next;
+                      });
+                    }
+                  }}
                 />
               </div>
             );
@@ -144,11 +169,13 @@ function TimelineRowView({
   row,
   selected,
   linked,
+  expanded,
   onClick
 }: {
   row: TimelineRow;
   selected: boolean;
   linked: boolean;
+  expanded: boolean;
   onClick: () => void;
 }) {
   const severity = row.kind === "TOKEN" ? "info" : row.severity ?? "info";
@@ -170,14 +197,26 @@ function TimelineRowView({
       </div>
       <div className="min-w-0">
         <div className="flex min-w-0 items-center gap-2">
+          {row.kind === "TOKEN" ? (
+            expanded ? (
+              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-yard-muted" aria-hidden="true" />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-yard-muted" aria-hidden="true" />
+            )
+          ) : null}
           <span className="truncate font-mono text-[11px] font-semibold text-yard-ink">{row.kind}</span>
           {"relatedId" in row && row.relatedId ? (
             <Link2 className="h-3.5 w-3.5 shrink-0 text-yard-teal" aria-hidden="true" />
           ) : null}
         </div>
-        <p className="mt-0.5 truncate text-xs leading-4 text-yard-muted">
+        <p className={cn("mt-0.5 text-xs leading-4 text-yard-muted", expanded ? "whitespace-pre-wrap break-words" : "truncate")}>
           {row.kind === "TOKEN" ? row.text : row.detail}
         </p>
+        {row.kind === "TOKEN" && expanded ? (
+          <p className="mt-1 font-mono text-[11px] leading-4 text-yard-muted">
+            grouped token span · stream {row.streamId}
+          </p>
+        ) : null}
       </div>
       {row.kind === "PARSE_ERROR" || row.kind === "DUPLICATE" ? (
         <Bug className="mt-0.5 h-4 w-4 text-yard-amber" aria-hidden="true" />

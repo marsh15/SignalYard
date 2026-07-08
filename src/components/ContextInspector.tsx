@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useDeferredValue, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronDown, ChevronRight, Database, GitCompareArrows, Search } from "lucide-react";
 import type { ProtocolEngine } from "@/protocol/engine";
@@ -27,6 +27,7 @@ interface JsonTreeRow {
 export function ContextInspector({ engine, snapshot }: ContextInspectorProps) {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(["$"]));
   const [query, setQuery] = useState("");
+  const deferredQuery = useDeferredValue(query);
   const parentRef = useRef<HTMLDivElement | null>(null);
   const contexts = Object.values(snapshot.contexts);
   const selectedContext =
@@ -37,9 +38,16 @@ export function ContextInspector({ engine, snapshot }: ContextInspectorProps) {
     () => createDiffIndex(selectedContext?.diff ?? []),
     [selectedContext?.diff]
   );
+  const selectedSnapshot = useMemo(() => {
+    if (!selectedContext) {
+      return undefined;
+    }
+
+    return selectedContext.history.find((entry) => entry.seq === selectedContext.selectedSeq)?.snapshot ?? selectedContext.current;
+  }, [selectedContext]);
   const rows = useMemo(
-    () => (selectedContext ? flattenJsonTree(selectedContext.current, expanded, diffIndex, query) : []),
-    [diffIndex, expanded, query, selectedContext]
+    () => (selectedSnapshot ? flattenJsonTree(selectedSnapshot, expanded, diffIndex, deferredQuery) : []),
+    [deferredQuery, diffIndex, expanded, selectedSnapshot]
   );
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -231,11 +239,18 @@ function flattenJsonTree(
   diffIndex: Record<string, DiffEntry>,
   query = ""
 ): JsonTreeRow[] {
+  const maxSearchVisits = 15_000;
   const rows: JsonTreeRow[] = [];
   const normalizedQuery = query.trim().toLowerCase();
   const searchMode = normalizedQuery.length > 0;
+  let visited = 0;
 
   function visit(node: JsonValue, key: string, path: string, depth: number) {
+    if (searchMode && visited >= maxSearchVisits) {
+      return false;
+    }
+    visited += 1;
+
     const expandable = Array.isArray(node) || isJsonObject(node);
     const isExpanded = searchMode ? true : expanded.has(path);
     const row: JsonTreeRow = {
@@ -267,7 +282,7 @@ function flattenJsonTree(
 
     const selfMatched = rowMatchesContextSearch(row, normalizedQuery);
     if (searchMode && !selfMatched && !descendantMatched) {
-      rows.splice(rowIndex, 1);
+      rows.splice(rowIndex, rows.length - rowIndex);
     }
     return selfMatched || descendantMatched;
   }

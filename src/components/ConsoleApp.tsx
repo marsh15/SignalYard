@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { Activity, Gauge, Network, RadioTower, RotateCcw, TerminalSquare } from "lucide-react";
 import type { ProtocolEngine } from "@/protocol/engine";
 import type { HarnessScenario } from "@/protocol/harness";
@@ -31,16 +31,12 @@ export function ConsoleApp({ scenario }: ConsoleAppProps) {
     window.__SIGNAL_YARD_ENGINE__ = engine;
   }, [engine]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (snapshot.pendingRenderSeq <= snapshot.lastRenderedSeq) {
       return;
     }
 
-    const frame = requestAnimationFrame(() => {
-      engine.commitRenderedSeq(snapshot.pendingRenderSeq);
-    });
-
-    return () => cancelAnimationFrame(frame);
+    engine.commitRenderedSeq(snapshot.pendingRenderSeq);
   }, [engine, snapshot.lastRenderedSeq, snapshot.pendingRenderSeq]);
 
   return (
@@ -78,6 +74,7 @@ function TopBar({
         : snapshot.connection.status === "error"
           ? "bg-yard-roseSoft text-yard-rose"
           : "bg-white text-yard-muted";
+  const visibleChaos = snapshot.chaos.filter((badge) => badge.label !== snapshot.connection.status);
 
   return (
     <header className="grid min-h-[64px] grid-cols-[auto_minmax(0,1fr)] items-center gap-3 border-b border-yard-line bg-white px-3 py-2 sm:px-4 lg:grid-cols-[auto_minmax(0,1fr)_auto]">
@@ -134,13 +131,13 @@ function TopBar({
             </option>
           ))}
         </select>
-        {snapshot.chaos.length === 0 ? (
+        {visibleChaos.length === 0 ? (
           <span className="shrink-0 whitespace-nowrap rounded border border-yard-line bg-yard-wash px-2 py-1 text-xs font-medium text-yard-muted">
             chaos evidence: clean
           </span>
         ) : (
           <>
-            {snapshot.chaos.slice(0, 2).map((badge) => (
+            {visibleChaos.slice(0, 2).map((badge) => (
               <span
                 key={badge.id}
                 className={cn(
@@ -155,15 +152,15 @@ function TopBar({
                 {badge.label}
               </span>
             ))}
-            {snapshot.chaos.length > 2 ? (
+            {visibleChaos.length > 2 ? (
               <span
                 className="shrink-0 whitespace-nowrap rounded border border-yard-line bg-yard-wash px-2 py-1 text-xs font-medium text-yard-muted"
-                title={snapshot.chaos
+                title={visibleChaos
                   .slice(2)
                   .map((badge) => `${badge.label}: ${badge.detail}`)
                   .join("\n")}
               >
-                +{snapshot.chaos.length - 2}
+                +{visibleChaos.length - 2}
               </span>
             ) : null}
           </>
