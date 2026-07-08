@@ -54,6 +54,8 @@ I also added local scenarios for testing without the backend:
   - `docs/recordings/chaos.mp4` (and the raw `chaos.webm` it was transcoded from) — a real ~4.5 minute recording captured against the actual Dockerized `agent-server --mode chaos` (not a scripted fixture). See "Chaos Recording" below.
 - Notes about the main decisions in `DECISIONS.md`
 
+No extra `assets/` directory is required for the submitted app. The reviewer-facing visual evidence is kept in `docs/screenshots/` and `docs/recordings/`.
+
 ## Project Structure
 
 - `src/protocol/engine.ts` has the WebSocket lifecycle, reconnect logic, sequence ordering, dedupe, heartbeat, and `TOOL_ACK` handling.
