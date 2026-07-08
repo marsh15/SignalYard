@@ -62,7 +62,7 @@ function makeHydratedEngine(snapshot: ReturnType<typeof createInitialSnapshot>) 
   window.sessionStorage.setItem(
     storageKey,
     JSON.stringify({
-      version: 1,
+      version: 2,
       snapshot
     })
   );
@@ -242,7 +242,7 @@ describe("ProtocolEngine control plane", () => {
     engine.dispose();
   });
 
-  it("does not answer historical PINGs during a resume replay burst", () => {
+  it("answers new PINGs even when the connection has resumable history", () => {
     vi.useFakeTimers();
     installTestWebSocket();
     const snapshot = createInitialSnapshot();
@@ -255,10 +255,15 @@ describe("ProtocolEngine control plane", () => {
     TestWebSocket.instances[0]?.open();
     engine.ingest({ type: "PING", seq: 12, challenge: "old-heartbeat" });
 
-    expect(outbound).toContainEqual({ type: "RESUME", last_seq: 11 });
-    expect(outbound.filter((message) => message.type === "PONG")).toHaveLength(0);
+    expect(outbound).not.toContainEqual({ type: "RESUME", last_seq: 11 });
+    expect(outbound.filter((message) => message.type === "PONG")).toEqual([
+      {
+        type: "PONG",
+        echo: "old-heartbeat"
+      }
+    ]);
     expect(engine.getSnapshot().timelineRows.filter((row) => row.kind === "PING")).toHaveLength(1);
-    expect(engine.getSnapshot().timelineRows.filter((row) => row.kind === "PONG")).toHaveLength(0);
+    expect(engine.getSnapshot().timelineRows.filter((row) => row.kind === "PONG")).toHaveLength(1);
 
     vi.advanceTimersByTime(750);
     engine.ingest({ type: "PING", seq: 13, challenge: "live-heartbeat" });
@@ -266,9 +271,33 @@ describe("ProtocolEngine control plane", () => {
     expect(outbound.filter((message) => message.type === "PONG")).toEqual([
       {
         type: "PONG",
+        echo: "old-heartbeat"
+      },
+      {
+        type: "PONG",
         echo: "live-heartbeat"
       }
     ]);
+
+    engine.dispose();
+  });
+
+  it("keeps session-global sequence tracking after sending a new user message", () => {
+    const { engine, outbound } = makeEngine();
+
+    engine.simulateConnection("connected");
+    engine.ingest({ type: "RUN_STARTED", seq: 1, title: "first run" });
+    engine.commitRenderedSeq(1);
+
+    expect(engine.sendUserMessage("continue")).toBe(true);
+    engine.ingest({ type: "TOKEN", seq: 2, stream_id: "main", text: "second response" });
+
+    const snapshot = engine.getSnapshot();
+    const tokenItem = snapshot.workItems.find((item) => item.kind === "tokens");
+
+    expect(outbound).toContainEqual({ type: "USER_MESSAGE", content: "continue" });
+    expect(snapshot.nextExpectedSeq).toBe(3);
+    expect(tokenItem?.kind === "tokens" ? tokenItem.text : "").toBe("second response");
 
     engine.dispose();
   });
@@ -288,6 +317,44 @@ describe("ProtocolEngine control plane", () => {
 });
 
 describe("ProtocolEngine WebSocket lifecycle", () => {
+  it("does not send RESUME on the first socket connection", () => {
+    vi.useFakeTimers();
+    installTestWebSocket();
+    const { engine, outbound } = makeEngine();
+
+    engine.connect();
+    TestWebSocket.instances[0]?.open();
+
+    expect(outbound.filter((message) => message.type === "RESUME")).toHaveLength(0);
+    expect(engine.getSnapshot().connection.status).toBe("connected");
+
+    engine.dispose();
+  });
+
+  it("sends RESUME only after a reconnect attempt", () => {
+    vi.useFakeTimers();
+    installTestWebSocket();
+    const { engine, outbound } = makeEngine();
+
+    engine.connect();
+    const socket = TestWebSocket.instances[0];
+    socket?.open();
+    engine.ingest({ type: "TOKEN", seq: 1, stream_id: "main", text: "A" });
+    engine.commitRenderedSeq(1);
+    socket?.closeFromServer();
+    vi.advanceTimersByTime(500);
+    TestWebSocket.instances[1]?.open();
+
+    expect(outbound.filter((message) => message.type === "RESUME")).toEqual([
+      {
+        type: "RESUME",
+        last_seq: 1
+      }
+    ]);
+
+    engine.dispose();
+  });
+
   it("does not reconnect after an intentional disconnect", () => {
     vi.useFakeTimers();
     installTestWebSocket();
@@ -508,7 +575,89 @@ describe("ProtocolEngine tool ACK policy", () => {
   });
 });
 
+describe("ProtocolEngine parse error recovery", () => {
+  it("produces a readable message instead of a raw Zod issue dump", () => {
+    const { engine } = makeEngine();
+
+    engine.ingest({ type: "BOGUS_EVENT", seq: 1, text: "nope" });
+
+    const parseErrorRow = engine.getSnapshot().timelineRows.find((row) => row.kind === "PARSE_ERROR");
+    const detail = parseErrorRow?.kind === "PARSE_ERROR" ? parseErrorRow.detail : undefined;
+    expect(detail).toContain('Unrecognized event type "BOGUS_EVENT"');
+    expect(detail).not.toContain("invalid_union_discriminator");
+
+    engine.dispose();
+  });
+
+  it("skips the unparseable seq instead of permanently blocking later events", () => {
+    const { engine } = makeEngine();
+
+    engine.ingest({ type: "BOGUS_EVENT", seq: 1, text: "nope" });
+    expect(engine.getSnapshot().nextExpectedSeq).toBe(2);
+
+    engine.ingest({ type: "TOKEN", seq: 2, stream_id: "main", text: "hello" });
+    const tokenItem = engine.getSnapshot().workItems[0];
+    expect(tokenItem?.kind === "tokens" ? tokenItem.text : "").toBe("hello");
+
+    engine.dispose();
+  });
+
+  it("drains events that were gap-buffered behind an unparseable seq", () => {
+    const { engine } = makeEngine();
+
+    engine.ingest({ type: "TOKEN", seq: 2, stream_id: "main", text: "second" });
+    expect(engine.getSnapshot().nextExpectedSeq).toBe(1);
+
+    engine.ingest({ type: "BOGUS_EVENT", seq: 1, text: "nope" });
+
+    expect(engine.getSnapshot().nextExpectedSeq).toBe(3);
+    const tokenItem = engine.getSnapshot().workItems[0];
+    expect(tokenItem?.kind === "tokens" ? tokenItem.text : "").toBe("second");
+
+    engine.dispose();
+  });
+});
+
 describe("context diffing", () => {
+  it("keeps the latest context snapshot stable after scrubbing history", () => {
+    const { engine } = makeEngine();
+
+    engine.ingest({
+      type: "CONTEXT_SNAPSHOT",
+      seq: 1,
+      context_id: "ctx",
+      data: { value: 1 }
+    });
+    engine.ingest({
+      type: "CONTEXT_SNAPSHOT",
+      seq: 2,
+      context_id: "ctx",
+      data: { value: 2 }
+    });
+    engine.selectContextSeq("ctx", 1);
+    engine.ingest({
+      type: "CONTEXT_SNAPSHOT",
+      seq: 3,
+      context_id: "ctx",
+      data: { value: 3 }
+    });
+
+    const context = engine.getSnapshot().contexts.ctx;
+
+    expect(context?.current).toEqual({ value: 3 });
+    expect(context?.selectedSeq).toBe(3);
+    expect(context?.diff).toEqual([
+      {
+        path: "$.value",
+        status: "changed",
+        before: 2,
+        after: 3
+      }
+    ]);
+
+    engine.dispose();
+  });
+
   it("marks added, removed, and changed JSON paths", () => {
     const diff = diffJson(
       {

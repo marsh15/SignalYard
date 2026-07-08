@@ -12,6 +12,7 @@ import {
   type ToolCallEvent,
   type ToolCard,
   type WorkItem,
+  describeParseError,
   parseServerMessage
 } from "./types";
 
@@ -32,7 +33,7 @@ interface ProtocolEngineOptions {
 const DEFAULT_URL = "ws://localhost:4747/ws";
 const BACKOFF_MS = [500, 1_000, 2_000, 4_000, 10_000] as const;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 18_000;
-const STORAGE_VERSION = 1;
+const STORAGE_VERSION = 2;
 
 export function createInitialSnapshot(url = DEFAULT_URL): EngineSnapshot {
   return {
@@ -71,6 +72,15 @@ function summarizeJson(value: JsonValue): string {
   return rendered.length > 120 ? `${rendered.slice(0, 119)}...` : rendered;
 }
 
+function extractRecoverableSeq(rawInput: unknown): number | undefined {
+  if (typeof rawInput !== "object" || rawInput === null || !("seq" in rawInput)) {
+    return undefined;
+  }
+
+  const seq = (rawInput as { seq?: unknown }).seq;
+  return typeof seq === "number" && Number.isInteger(seq) && seq > 0 ? seq : undefined;
+}
+
 function isToolRow(row: TimelineRow): boolean {
   return row.kind === "TOOL_CALL" || row.kind === "TOOL_RESULT" || row.kind === "ACK";
 }
@@ -80,7 +90,9 @@ function rowMatchesFilter(row: TimelineRow, filter: EngineSnapshot["timelineFilt
   if (filter === "tokens") return row.kind === "TOKEN";
   if (filter === "tools") return isToolRow(row);
   if (filter === "context") return row.kind === "CONTEXT_SNAPSHOT" || row.kind === "CONTEXT_PATCH";
-  if (filter === "control") return row.kind === "PING" || row.kind === "PONG" || row.kind === "STATUS";
+  if (filter === "control") {
+    return row.kind === "PING" || row.kind === "PONG" || row.kind === "STATUS" || row.kind === "STREAM_END";
+  }
   return row.kind === "ERROR" || row.kind === "PARSE_ERROR";
 }
 
@@ -95,7 +107,6 @@ export class ProtocolEngine {
   private socket?: WebSocket;
   private reconnectTimer?: TimerHandle;
   private heartbeatTimer?: TimerHandle;
-  private resumeReplayTimer?: TimerHandle;
   private notifyRaf?: number;
   private sender?: Sender;
   private diffWorker?: Worker;
@@ -103,7 +114,6 @@ export class ProtocolEngine {
   private heartbeatTimeoutMs: number;
   private storageKey?: string;
   private duplicateTimelineRowCounter = 0;
-  private suppressReplayPongs = false;
   private pongedPingSeqs = new Set<number>();
 
   constructor(options: ProtocolEngineOptions = {}) {
@@ -152,10 +162,12 @@ export class ProtocolEngine {
         return;
       }
 
-      this.setConnection("resuming", { attempt: 0 });
-      this.beginResumeReplayGuard(this.snapshot.lastRenderedSeq);
-      this.send({ type: "RESUME", last_seq: this.snapshot.lastRenderedSeq });
-      this.flushRenderedToolAcks(this.snapshot.lastRenderedSeq);
+      const reconnectAttempt = this.snapshot.connection.attempt;
+      if (reconnectAttempt > 0) {
+        this.setConnection("resuming", { attempt: reconnectAttempt });
+        this.send({ type: "RESUME", last_seq: this.snapshot.lastRenderedSeq });
+        this.flushRenderedToolAcks(this.snapshot.lastRenderedSeq);
+      }
       this.setConnection("connected", { attempt: 0 });
       this.markPacketReceived();
     };
@@ -192,8 +204,6 @@ export class ProtocolEngine {
     this.socket = undefined;
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
-    this.clearResumeReplayTimer();
-    this.suppressReplayPongs = false;
     socket?.close();
     this.setConnection("closed", { reconnectInMs: undefined });
   }
@@ -206,6 +216,7 @@ export class ProtocolEngine {
       const parsed: unknown = typeof data === "string" ? JSON.parse(data) : data;
       this.ingest(parsed);
     } catch (error) {
+      // Raw JSON.parse failure: there is no object to recover a seq from.
       this.recordParseError(error);
     }
   }
@@ -216,12 +227,11 @@ export class ProtocolEngine {
     try {
       event = parseServerMessage(input);
     } catch (error) {
-      this.recordParseError(error);
+      this.recordParseError(error, input);
       return;
     }
 
     this.markPacketReceived();
-    this.bumpResumeReplayGuard();
 
     if (this.seenSeqs.has(event.seq)) {
       this.snapshot = {
@@ -252,7 +262,7 @@ export class ProtocolEngine {
 
     this.seenSeqs.add(event.seq);
 
-    if (event.type === "PING" && !this.suppressReplayPongs) {
+    if (event.type === "PING") {
       const rttStartedAt = performanceNow();
       this.send({
         type: "PONG",
@@ -336,6 +346,7 @@ export class ProtocolEngine {
       return false;
     }
 
+    this.startNewRun();
     this.send({
       type: "USER_MESSAGE",
       content: trimmed
@@ -374,6 +385,23 @@ export class ProtocolEngine {
     this.notify();
   }
 
+  selectToolCard(toolCallId: string) {
+    const card = this.snapshot.toolCards[toolCallId];
+    const row = this.snapshot.timelineRows.find(
+      (candidate) => "toolCallId" in candidate && candidate.toolCallId === toolCallId && candidate.kind === "TOOL_CALL"
+    );
+
+    this.snapshot = {
+      ...this.snapshot,
+      selectedTimelineRowId: row?.id,
+      highlightedToolCallId: toolCallId,
+      highlightedSeq: row?.seq ?? card?.seq,
+      timelineFilter: "tools",
+      timelineSearch: ""
+    };
+    this.notify();
+  }
+
   selectContext(contextId: string | undefined) {
     this.snapshot = { ...this.snapshot, selectedContextId: contextId };
     this.notify();
@@ -390,7 +418,6 @@ export class ProtocolEngine {
     const previous = previousIndex >= 0 ? context.history[previousIndex]?.snapshot ?? null : null;
     const updatedContext: ContextRecord = {
       ...context,
-      current: selected.snapshot,
       selectedSeq: seq,
       diffPending: true
     };
@@ -407,6 +434,14 @@ export class ProtocolEngine {
   }
 
   simulateConnection(status: ConnectionStatus) {
+    if (status === "reconnecting") {
+      this.addChaos({
+        label: "reconnecting",
+        detail: "Simulated transport interruption",
+        severity: "warning"
+      });
+    }
+
     this.setConnection(status, {
       reconnectInMs: status === "reconnecting" ? BACKOFF_MS[0] : undefined
     });
@@ -415,8 +450,6 @@ export class ProtocolEngine {
   reset(url = this.snapshot.connection.url) {
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
-    this.clearResumeReplayTimer();
-    this.suppressReplayPongs = false;
     this.pendingFallbackAcks.forEach((timer) => clearTimeout(timer));
     this.pendingFallbackAcks.clear();
     this.snapshot = createInitialSnapshot(url);
@@ -586,6 +619,24 @@ export class ProtocolEngine {
           seq: event.seq
         });
         break;
+      case "STREAM_END":
+        this.addTimelineRow({
+          id: `stream-end-${event.stream_id}-${event.seq}`,
+          kind: "STREAM_END",
+          seq: event.seq,
+          endSeq: event.seq,
+          label: "Stream ended",
+          detail: event.stream_id,
+          streamId: event.stream_id,
+          severity: "success"
+        });
+        this.addChaos({
+          label: "Run complete",
+          detail: `Stream ${event.stream_id} ended`,
+          severity: "success",
+          seq: event.seq
+        });
+        break;
       case "STATUS":
         this.addTimelineRow({
           id: `status-${event.seq}`,
@@ -672,6 +723,15 @@ export class ProtocolEngine {
         });
         break;
     }
+  }
+
+  private startNewRun() {
+    this.snapshot = {
+      ...this.snapshot,
+      selectedTimelineRowId: undefined,
+      highlightedSeq: undefined,
+      highlightedToolCallId: undefined
+    };
   }
 
   private addMessage(event: Extract<ServerMessage, { type: "MESSAGE" }>) {
@@ -841,7 +901,7 @@ export class ProtocolEngine {
 
   private addContextSnapshot(contextId: string, seq: number, snapshot: JsonValue) {
     const previous = this.snapshot.contexts[contextId];
-    const previousSnapshot = previous?.current ?? null;
+    const previousSnapshot = previous?.history.at(-1)?.snapshot ?? previous?.current ?? null;
     const history = [...(previous?.history ?? []), { seq, snapshot }];
     const context: ContextRecord = {
       contextId,
@@ -1035,31 +1095,6 @@ export class ProtocolEngine {
     }
   }
 
-  private beginResumeReplayGuard(resumeSeq: number) {
-    this.clearResumeReplayTimer();
-    this.suppressReplayPongs = resumeSeq > 0;
-    this.bumpResumeReplayGuard();
-  }
-
-  private bumpResumeReplayGuard() {
-    if (!this.suppressReplayPongs) {
-      return;
-    }
-
-    this.clearResumeReplayTimer();
-    this.resumeReplayTimer = setTimeout(() => {
-      this.resumeReplayTimer = undefined;
-      this.suppressReplayPongs = false;
-    }, 750);
-  }
-
-  private clearResumeReplayTimer() {
-    if (this.resumeReplayTimer) {
-      clearTimeout(this.resumeReplayTimer);
-      this.resumeReplayTimer = undefined;
-    }
-  }
-
   private scheduleReconnect() {
     const nextAttempt = this.snapshot.connection.attempt + 1;
     const reconnectInMs = BACKOFF_MS[Math.min(nextAttempt - 1, BACKOFF_MS.length - 1)];
@@ -1143,8 +1178,11 @@ export class ProtocolEngine {
     this.notify();
   }
 
-  private recordParseError(error: unknown) {
-    const message = error instanceof Error ? error.message : "Unknown parser error";
+  private recordParseError(error: unknown, rawInput?: unknown) {
+    const message = describeParseError(error, rawInput);
+    const recoveredSeq = extractRecoverableSeq(rawInput);
+    const rowSeq = recoveredSeq ?? this.snapshot.pendingRenderSeq;
+
     this.snapshot = {
       ...this.snapshot,
       parseErrors: [...this.snapshot.parseErrors, message],
@@ -1153,10 +1191,13 @@ export class ProtocolEngine {
         {
           id: nowId("parse-error"),
           kind: "PARSE_ERROR",
-          seq: this.snapshot.pendingRenderSeq,
-          endSeq: this.snapshot.pendingRenderSeq,
+          seq: rowSeq,
+          endSeq: rowSeq,
           label: "Parser rejected payload",
-          detail: message,
+          detail:
+            recoveredSeq !== undefined
+              ? `${message} (seq ${recoveredSeq} skipped so later events are not blocked)`
+              : message,
           severity: "error"
         } satisfies TimelineEventRow
       ]
@@ -1166,6 +1207,36 @@ export class ProtocolEngine {
       detail: message,
       severity: "error"
     });
+
+    // A payload that fails schema validation never reaches processOrdered(), so its seq
+    // would otherwise never be marked consumed. Without this, a single malformed message
+    // permanently blocks nextExpectedSeq, and every later (valid) message queues up in
+    // orderedBuffer forever instead of rendering - a silent, permanent stream freeze.
+    if (recoveredSeq !== undefined) {
+      this.skipUnparseableSeq(recoveredSeq);
+      return;
+    }
+
+    this.notify();
+  }
+
+  private skipUnparseableSeq(seq: number) {
+    if (this.seenSeqs.has(seq)) {
+      this.notify();
+      return;
+    }
+
+    this.seenSeqs.add(seq);
+
+    if (seq === this.snapshot.nextExpectedSeq) {
+      this.snapshot = {
+        ...this.snapshot,
+        nextExpectedSeq: this.snapshot.nextExpectedSeq + 1
+      };
+      this.processOrdered();
+      return;
+    }
+
     this.notify();
   }
 

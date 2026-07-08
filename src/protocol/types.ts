@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z, ZodError } from "zod";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -92,6 +92,11 @@ export const runCompletedEventSchema = baseEventSchema.extend({
   outcome: z.enum(["success", "failed", "cancelled"]).default("success")
 });
 
+export const streamEndEventSchema = baseEventSchema.extend({
+  type: z.literal("STREAM_END"),
+  stream_id: z.string().default("default")
+});
+
 export const serverMessageSchema = z.discriminatedUnion("type", [
   tokenEventSchema,
   messageEventSchema,
@@ -103,7 +108,8 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
   statusEventSchema,
   errorEventSchema,
   runStartedEventSchema,
-  runCompletedEventSchema
+  runCompletedEventSchema,
+  streamEndEventSchema
 ]);
 
 export type TokenEvent = z.infer<typeof tokenEventSchema>;
@@ -117,6 +123,7 @@ export type StatusEvent = z.infer<typeof statusEventSchema>;
 export type ErrorEvent = z.infer<typeof errorEventSchema>;
 export type RunStartedEvent = z.infer<typeof runStartedEventSchema>;
 export type RunCompletedEvent = z.infer<typeof runCompletedEventSchema>;
+export type StreamEndEvent = z.infer<typeof streamEndEventSchema>;
 export type ServerMessage = z.infer<typeof serverMessageSchema>;
 
 export type ClientMessage =
@@ -283,6 +290,34 @@ export interface EngineSnapshot {
 
 export function parseServerMessage(input: unknown): ServerMessage {
   return serverMessageSchema.parse(input);
+}
+
+const KNOWN_MESSAGE_TYPES = serverMessageSchema.options.map((option) => option.shape.type.value);
+
+/**
+ * Turns a raw parser failure into an operator-readable one-liner instead of the
+ * default ZodError message, which dumps the entire issues array as raw JSON.
+ */
+export function describeParseError(error: unknown, rawInput?: unknown): string {
+  if (error instanceof ZodError) {
+    const issue = error.issues[0];
+    if (issue?.code === "invalid_union_discriminator") {
+      const receivedType =
+        typeof rawInput === "object" && rawInput !== null && "type" in rawInput
+          ? String((rawInput as { type?: unknown }).type)
+          : "unknown";
+      return `Unrecognized event type "${receivedType}" (known types: ${KNOWN_MESSAGE_TYPES.join(", ")})`;
+    }
+
+    if (issue) {
+      const path = issue.path.length > 0 ? `${issue.path.join(".")}: ` : "";
+      return `${path}${issue.message}`;
+    }
+
+    return "Payload failed schema validation";
+  }
+
+  return error instanceof Error ? error.message : "Unknown parser error";
 }
 
 export function isJsonObject(value: JsonValue): value is { [key: string]: JsonValue } {

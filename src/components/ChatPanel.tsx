@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, Copy, CornerDownRight, PauseCircle, Send, Wrench } from "lucide-react";
 import type { ProtocolEngine } from "@/protocol/engine";
 import type { EngineSnapshot, ToolCard, WorkItem } from "@/protocol/types";
@@ -14,6 +14,11 @@ interface ChatPanelProps {
 export function ChatPanel({ engine, snapshot }: ChatPanelProps) {
   const [draft, setDraft] = useState("");
   const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const itemRefs = useRef(new Map<string, HTMLElement>());
+  const selectedItemId = useMemo(
+    () => findLinkedWorkItemId(snapshot.workItems, snapshot.highlightedSeq, snapshot.highlightedToolCallId),
+    [snapshot.highlightedSeq, snapshot.highlightedToolCallId, snapshot.workItems]
+  );
 
   useEffect(() => {
     const scroller = scrollerRef.current;
@@ -26,6 +31,17 @@ export function ChatPanel({ engine, snapshot }: ChatPanelProps) {
       scroller.scrollTop = scroller.scrollHeight;
     }
   }, [snapshot.workItems.length, snapshot.pendingRenderSeq]);
+
+  useEffect(() => {
+    if (!selectedItemId) {
+      return;
+    }
+
+    itemRefs.current.get(selectedItemId)?.scrollIntoView({
+      block: "center",
+      behavior: "smooth"
+    });
+  }, [selectedItemId]);
 
   const reconnecting =
     snapshot.connection.status === "reconnecting" || snapshot.connection.status === "resuming";
@@ -56,15 +72,33 @@ export function ChatPanel({ engine, snapshot }: ChatPanelProps) {
           {snapshot.workItems.length === 0 ? (
             <EmptyWorkstream />
           ) : (
-            snapshot.workItems.map((item) => (
-              <WorkstreamItem
-                key={item.id}
-                item={item}
-                toolCard={item.kind === "tool" ? snapshot.toolCards[item.toolCallId] : undefined}
-                highlightedToolCallId={snapshot.highlightedToolCallId}
-                onHighlight={(toolCallId) => engine.highlightTool(toolCallId)}
-              />
-            ))
+            snapshot.workItems.map((item) => {
+              const toolCard = item.kind === "tool" ? snapshot.toolCards[item.toolCallId] : undefined;
+              const highlighted = selectedItemId === item.id;
+
+              return (
+                <div
+                  key={item.id}
+                  ref={(node) => {
+                    if (node) {
+                      itemRefs.current.set(item.id, node);
+                    } else {
+                      itemRefs.current.delete(item.id);
+                    }
+                  }}
+                  className="scroll-m-6"
+                >
+                  <WorkstreamItem
+                    item={item}
+                    toolCard={toolCard}
+                    highlighted={highlighted}
+                    highlightedToolCallId={snapshot.highlightedToolCallId}
+                    onHighlight={(toolCallId) => engine.highlightTool(toolCallId)}
+                    onSelectTool={(toolCallId) => engine.selectToolCard(toolCallId)}
+                  />
+                </div>
+              );
+            })
           )}
         </div>
       </div>
@@ -124,17 +158,21 @@ function EmptyWorkstream() {
 function WorkstreamItem({
   item,
   toolCard,
+  highlighted,
   highlightedToolCallId,
-  onHighlight
+  onHighlight,
+  onSelectTool
 }: {
   item: WorkItem;
   toolCard?: ToolCard;
+  highlighted: boolean;
   highlightedToolCallId?: string;
   onHighlight: (toolCallId: string | undefined) => void;
+  onSelectTool: (toolCallId: string) => void;
 }) {
   if (item.kind === "message") {
     return (
-      <article className="rounded border border-yard-line bg-white p-3">
+      <article className={cn("rounded border bg-white p-3 transition", highlighted ? "border-yard-teal shadow-panel" : "border-yard-line")}>
         <div className="mb-1 flex items-center justify-between gap-2">
           <span className="text-xs font-semibold uppercase tracking-normal text-yard-muted">{item.role}</span>
           <SeqLabel start={item.seq} />
@@ -149,7 +187,8 @@ function WorkstreamItem({
       <article
         className={cn(
           "rounded border bg-white p-3 transition",
-          item.frozen ? "border-yard-amber/30" : "border-yard-line"
+          item.frozen ? "border-yard-amber/30" : "border-yard-line",
+          highlighted && "border-yard-teal shadow-panel"
         )}
       >
         <div className="mb-1 flex items-center justify-between gap-2">
@@ -175,8 +214,9 @@ function WorkstreamItem({
   return (
     <ToolCardView
       card={toolCard}
-      highlighted={highlightedToolCallId === toolCard.id}
+      highlighted={highlighted || highlightedToolCallId === toolCard.id}
       onHighlight={onHighlight}
+      onSelect={onSelectTool}
     />
   );
 }
@@ -184,11 +224,13 @@ function WorkstreamItem({
 function ToolCardView({
   card,
   highlighted,
-  onHighlight
+  onHighlight,
+  onSelect
 }: {
   card: ToolCard;
   highlighted: boolean;
   onHighlight: (toolCallId: string | undefined) => void;
+  onSelect: (toolCallId: string) => void;
 }) {
   const statusTone =
     card.status === "complete"
@@ -201,8 +243,9 @@ function ToolCardView({
     <article
       onMouseEnter={() => onHighlight(card.id)}
       onMouseLeave={() => onHighlight(undefined)}
+      onClick={() => onSelect(card.id)}
       className={cn(
-        "rounded border bg-white p-3 transition",
+        "cursor-pointer rounded border bg-white p-3 transition",
         highlighted ? "border-yard-teal shadow-panel" : "border-yard-line"
       )}
     >
@@ -245,6 +288,32 @@ function ToolCardView({
       </div>
     </article>
   );
+}
+
+function findLinkedWorkItemId(
+  workItems: WorkItem[],
+  highlightedSeq?: number,
+  highlightedToolCallId?: string
+): string | undefined {
+  if (highlightedToolCallId) {
+    return workItems.find((item) => item.kind === "tool" && item.toolCallId === highlightedToolCallId)?.id;
+  }
+
+  if (highlightedSeq === undefined) {
+    return undefined;
+  }
+
+  return workItems.find((item) => {
+    if (item.kind === "message") {
+      return item.seq === highlightedSeq;
+    }
+
+    if (item.kind === "tool") {
+      return item.seq === highlightedSeq;
+    }
+
+    return item.startSeq <= highlightedSeq && highlightedSeq <= item.endSeq;
+  })?.id;
 }
 
 function JsonBlock({ label, value }: { label: string; value: unknown }) {
